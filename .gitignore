@@ -1,0 +1,18 @@
+# Swift Package Manager
+.build/
+.build.*
+DerivedData/
+
+# Xcode
+*.xcworkspace
+*.xcuserdata
+*.xcodeproj/xcuserdata
+*.xcodeproj/project.xcworkspace
+
+# macOS
+.DS_Store
+
+# Editor temp files
+*~
+*.swp
+*.swo
