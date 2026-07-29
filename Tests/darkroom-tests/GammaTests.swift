@@ -11,9 +11,11 @@ func darkroomTableValues() {
 
     for i in 0..<capacity {
         let input = Float(i) / Float(maxIndex)
-        #expect(abs(table.red[i] - (1.0 - input)) < 0.001)
+        #expect(abs(table.red[i] - input) < 0.001)
     }
 
+    #expect(table.red.first == 0)
+    #expect(table.red.last == 1)
     #expect(table.green.allSatisfy { $0 == 0 })
     #expect(table.blue.allSatisfy { $0 == 0 })
 }
@@ -55,8 +57,8 @@ func minimumCapacity() {
     var table = GammaTable(capacity: 2)
     table.setDarkroom()
 
-    #expect(abs(table.red[0] - 1.0) < 0.001)
-    #expect(abs(table.red[1] - 0.0) < 0.001)
+    #expect(abs(table.red[0] - 0.0) < 0.001)
+    #expect(abs(table.red[1] - 1.0) < 0.001)
     #expect(table.green[0] == 0)
     #expect(table.green[1] == 0)
     #expect(table.blue[0] == 0)

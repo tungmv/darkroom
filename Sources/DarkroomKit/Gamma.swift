@@ -17,7 +17,7 @@ public struct GammaTable: Sendable {
         let maxIndex = capacity - 1
         for i in 0..<capacity {
             let input = CGGammaValue(i) / CGGammaValue(maxIndex)
-            red[i] = 1.0 - input
+            red[i] = input
             green[i] = 0.0
             blue[i] = 0.0
         }
