@@ -4,6 +4,32 @@ import Foundation
 
 // MARK: - Daemon helpers
 
+/// Resolve the executable path used to invoke this process.
+///
+/// Shells commonly preserve `argv[0]` as just `darkroom`, even when they found
+/// it through `PATH`, so it cannot be assumed to be an absolute path.
+func invokedExecutablePath() -> String? {
+    let invocation = CommandLine.arguments[0]
+    let fileManager = FileManager.default
+
+    if invocation.contains("/") {
+        return fileManager.fileExists(atPath: invocation) ? invocation : nil
+    }
+
+    let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
+    for directory in path.split(separator: ":", omittingEmptySubsequences: false) {
+        let base = directory.isEmpty ? "." : String(directory)
+        let candidate = URL(fileURLWithPath: base)
+            .appendingPathComponent(invocation)
+            .path
+        if fileManager.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+    }
+
+    return nil
+}
+
 /// Start darkroomd in the background if it isn't already running.
 /// Returns true if the daemon is now running.
 func ensureDaemon() -> Bool {
@@ -13,11 +39,14 @@ func ensureDaemon() -> Bool {
     }
 
     // Find darkroomd binary next to this process.
-    let ourPath = CommandLine.arguments[0]
     let daemonPath: String
-    if ourPath.hasSuffix("/darkroom") {
+    if let ourPath = invokedExecutablePath(),
+       URL(fileURLWithPath: ourPath).lastPathComponent == "darkroom" {
         // Installed side-by-side.
-        daemonPath = ourPath.replacingOccurrences(of: "/darkroom", with: "/darkroomd")
+        daemonPath = URL(fileURLWithPath: ourPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent("darkroomd")
+            .path
     } else {
         // Running via swift run — try common locations.
         let candidates = [
@@ -30,8 +59,7 @@ func ensureDaemon() -> Bool {
     }
 
     let task = Process()
-    task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    task.arguments = [daemonPath]
+    task.executableURL = URL(fileURLWithPath: daemonPath)
     task.standardOutput = FileHandle.nullDevice
     task.standardError = FileHandle.nullDevice
     try? task.run()
