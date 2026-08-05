@@ -3,143 +3,249 @@ import Darwin
 import DarkroomKit
 import Foundation
 
-// MARK: - State (nonisolated to avoid Swift 6 MainActor isolation)
+final class DarkroomDaemon: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "sh.darkroom.darkroomd.state")
+    private let gammaApplier = GammaApplier()
+    private var darkroomEnabled = false
+    private var gammaTimer: DispatchSourceTimer?
+    private var signalSources: [DispatchSourceSignal] = []
+    private var lockFD: Int32 = -1
 
-nonisolated(unsafe) var darkroomEnabled = false
-nonisolated(unsafe) var gammaTimer: DispatchSourceTimer?
+    func run() -> Never {
+        acquireInstanceLock()
+        setupSignals()
 
-// MARK: - Signal handling
+        queue.sync {
+            let ids = getActiveDisplayIDs()
+            darkroomEnabled = ids.contains { readDarkroomActive(for: $0) }
+            if darkroomEnabled {
+                startGammaTimer()
+            }
+        }
 
-func setupSignals() {
-    // SIGINT / SIGTERM → restore gamma and exit.
-    signal(SIGINT, { _ in restoreAndExit() })
-    signal(SIGTERM, { _ in restoreAndExit() })
-
-    // Don't crash on disconnected clients.
-    signal(SIGPIPE, SIG_IGN)
-}
-
-func restoreAndExit() {
-    fputs("darkroomd: restoring gamma and exiting\n", stderr)
-    gammaTimer?.cancel()
-    let ids = getActiveDisplays().map(\.id)
-    applyGamma(enabled: false, to: ids)
-    darkroomEnabled = false
-    unlink(DaemonSocket.path)
-    exit(0)
-}
-
-// MARK: - Gamma timer (reapply periodically to beat ColorSync / Lunar)
-
-func startGammaTimer() {
-    gammaTimer?.cancel()
-    let timer = DispatchSource.makeTimerSource(queue: .global())
-    timer.schedule(deadline: .now(), repeating: .milliseconds(500))
-    timer.setEventHandler {
-        guard darkroomEnabled else { return }
-        let ids = getActiveDisplays().map(\.id)
-        applyGamma(enabled: true, to: ids)
-    }
-    timer.resume()
-    gammaTimer = timer
-}
-
-// MARK: - Socket server
-
-func runServer() {
-    let sock = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard sock >= 0 else {
-        fatalError("socket() failed: \(String(cString: strerror(errno)))")
+        runServer()
     }
 
-    // Remove stale socket file.
-    unlink(DaemonSocket.path)
+    // MARK: - Process lifetime
 
-    var addr = sockaddr_un()
-    addr.sun_family = sa_family_t(AF_UNIX)
-    let pathCap = MemoryLayout.size(ofValue: addr.sun_path)
-    withUnsafeMutablePointer(to: &addr.sun_path) { sunPathPtr in
-        sunPathPtr.withMemoryRebound(to: Int8.self, capacity: pathCap) { bufPtr in
-            _ = DaemonSocket.path.withCString { strcpy(bufPtr, $0) }
+    private func acquireInstanceLock() {
+        let lockPath = URL(fileURLWithPath: DaemonSocket.path)
+            .deletingLastPathComponent()
+            .appendingPathComponent("darkroomd.lock")
+            .path
+
+        lockFD = open(lockPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
+        guard lockFD >= 0 else {
+            fatalError("open lock failed: \(lastError)")
+        }
+        guard flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
+            fputs("darkroomd: another instance is already running\n", stderr)
+            exit(0)
         }
     }
 
-    guard bind(sock, sockaddrCast(&addr), socklen_t(MemoryLayout<sockaddr_un>.size)) == 0 else {
-        fatalError("bind() failed: \(String(cString: strerror(errno)))")
-    }
-    guard listen(sock, 8) == 0 else {
-        fatalError("listen() failed: \(String(cString: strerror(errno)))")
-    }
+    private func setupSignals() {
+        // Dispatch signal sources let cleanup happen outside a signal handler.
+        signal(SIGINT, SIG_IGN)
+        signal(SIGTERM, SIG_IGN)
+        signal(SIGPIPE, SIG_IGN)
 
-    fputs("darkroomd: listening on \(DaemonSocket.path)\n", stderr)
-
-    while true {
-        let client = accept(sock, nil, nil)
-        guard client >= 0 else {
-            if errno == EINTR { continue }
-            fputs("darkroomd: accept error: \(String(cString: strerror(errno)))\n", stderr)
-            continue
-        }
-
-        DispatchQueue.global().async {
-            handleClient(client)
-            close(client)
+        for signalNumber in [SIGINT, SIGTERM] {
+            let source = DispatchSource.makeSignalSource(
+                signal: signalNumber,
+                queue: queue
+            )
+            source.setEventHandler { [weak self] in
+                self?.restoreAndExit()
+            }
+            source.resume()
+            signalSources.append(source)
         }
     }
-}
 
-func handleClient(_ fd: Int32) {
-    var buf = [UInt8](repeating: 0, count: 256)
-    let n = read(fd, &buf, buf.count)
-    guard n > 0 else { return }
-
-    let raw = String(decoding: buf[0..<n], as: UTF8.self)
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-
-    guard let cmd = DarkroomCommand(rawValue: raw) else {
-        _ = respond(fd, "error: unknown command '\(raw)'")
-        return
+    private func restoreAndExit() -> Never {
+        fputs("darkroomd: restoring gamma and exiting\n", stderr)
+        stopGammaTimer()
+        _ = gammaApplier.apply(enabled: false, to: getActiveDisplayIDs())
+        darkroomEnabled = false
+        unlink(DaemonSocket.path)
+        if lockFD >= 0 {
+            close(lockFD)
+        }
+        exit(0)
     }
 
-    switch cmd {
-    case .on:
-        let ids = getActiveDisplays().map(\.id)
-        applyGamma(enabled: true, to: ids)
-        darkroomEnabled = true
-        startGammaTimer()
-        _ = respond(fd, "on ok")
+    // MARK: - Gamma timer
 
-    case .off:
+    private func startGammaTimer() {
+        guard gammaTimer == nil else { return }
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(
+            deadline: .now() + .milliseconds(500),
+            repeating: .milliseconds(500),
+            leeway: .milliseconds(50)
+        )
+        timer.setEventHandler { [weak self] in
+            guard let self, self.darkroomEnabled else { return }
+            _ = self.gammaApplier.apply(
+                enabled: true,
+                to: getActiveDisplayIDs()
+            )
+        }
+        timer.resume()
+        gammaTimer = timer
+    }
+
+    private func stopGammaTimer() {
         gammaTimer?.cancel()
         gammaTimer = nil
-        let ids = getActiveDisplays().map(\.id)
-        applyGamma(enabled: false, to: ids)
-        darkroomEnabled = false
-        _ = respond(fd, "off ok")
+    }
 
-    case .status:
-        _ = respond(fd, darkroomEnabled ? "on" : "off")
+    // MARK: - Socket server
 
-    case .stop:
-        _ = respond(fd, "stopping")
-        restoreAndExit()
+    private func runServer() -> Never {
+        let socketFD = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard socketFD >= 0 else {
+            fatalError("socket() failed: \(lastError)")
+        }
+
+        unlink(DaemonSocket.path)
+
+        let addressResult = DaemonSocket.makeAddress()
+        guard case .success(var address) = addressResult else {
+            if case .failure(let error) = addressResult {
+                fatalError(error.description)
+            }
+            preconditionFailure("unreachable result state")
+        }
+
+        guard bind(
+            socketFD,
+            sockaddrCast(&address),
+            socklen_t(MemoryLayout<sockaddr_un>.size)
+        ) == 0 else {
+            fatalError("bind() failed: \(lastError)")
+        }
+        _ = chmod(DaemonSocket.path, S_IRUSR | S_IWUSR)
+
+        guard listen(socketFD, 8) == 0 else {
+            fatalError("listen() failed: \(lastError)")
+        }
+
+        fputs("darkroomd: listening on \(DaemonSocket.path)\n", stderr)
+
+        while true {
+            let clientFD = accept(socketFD, nil, nil)
+            guard clientFD >= 0 else {
+                if errno == EINTR { continue }
+                fputs("darkroomd: accept error: \(lastError)\n", stderr)
+                continue
+            }
+
+            queue.async { [weak self] in
+                self?.handleClient(clientFD)
+                close(clientFD)
+            }
+        }
+    }
+
+    private func handleClient(_ fd: Int32) {
+        guard let rawCommand = readCommand(from: fd),
+              let command = DarkroomCommand(rawValue: rawCommand)
+        else {
+            _ = respond(fd, "error: invalid command")
+            return
+        }
+
+        switch command {
+        case .on:
+            let ids = getActiveDisplayIDs()
+            guard gammaApplier.apply(enabled: true, to: ids) else {
+                _ = gammaApplier.apply(enabled: false, to: ids)
+                darkroomEnabled = false
+                stopGammaTimer()
+                _ = respond(fd, "error: failed to apply gamma to all active displays")
+                return
+            }
+
+            darkroomEnabled = true
+            startGammaTimer()
+            _ = respond(fd, "on ok")
+
+        case .off:
+            stopGammaTimer()
+            darkroomEnabled = false
+            guard gammaApplier.apply(enabled: false, to: getActiveDisplayIDs()) else {
+                _ = respond(fd, "error: failed to restore gamma on all active displays")
+                return
+            }
+            _ = respond(fd, "off ok")
+
+        case .status:
+            _ = respond(fd, darkroomEnabled ? "on" : "off")
+
+        case .stop:
+            _ = respond(fd, "stopping")
+            restoreAndExit()
+        }
+    }
+
+    private func readCommand(from fd: Int32) -> String? {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(16)
+        var buffer = [UInt8](repeating: 0, count: 64)
+
+        while bytes.count < 256 {
+            let count = read(fd, &buffer, buffer.count)
+            if count > 0 {
+                bytes.append(contentsOf: buffer.prefix(count))
+                if bytes.contains(0x0A) { break }
+                continue
+            }
+            if count < 0 && errno == EINTR { continue }
+            break
+        }
+
+        guard !bytes.isEmpty else { return nil }
+        let line = bytes.prefix { $0 != 0x0A }
+        return String(decoding: line, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func respond(_ fd: Int32, _ message: String) -> Bool {
+        let bytes = Array((message + "\n").utf8)
+        return bytes.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return true }
+
+            var offset = 0
+            while offset < rawBuffer.count {
+                let count = write(
+                    fd,
+                    baseAddress.advanced(by: offset),
+                    rawBuffer.count - offset
+                )
+                if count > 0 {
+                    offset += count
+                } else if count < 0 && errno == EINTR {
+                    continue
+                } else {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
+    private func sockaddrCast(
+        _ pointer: UnsafeMutablePointer<sockaddr_un>
+    ) -> UnsafeMutablePointer<sockaddr> {
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
+    }
+
+    private var lastError: String {
+        String(cString: strerror(errno))
     }
 }
 
-func respond(_ fd: Int32, _ message: String) -> Bool {
-    let payload = message + "\n"
-    return payload.withCString {
-        write(fd, $0, payload.utf8.count) > 0
-    }
-}
-
-// MARK: - Helpers
-
-func sockaddrCast(_ ptr: UnsafeMutablePointer<sockaddr_un>) -> UnsafeMutablePointer<sockaddr> {
-    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { $0 }
-}
-
-// MARK: - Entry
-
-setupSignals()
-runServer()
+DarkroomDaemon().run()

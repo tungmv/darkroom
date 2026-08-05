@@ -11,6 +11,16 @@ public struct DisplayInfo: Sendable {
 }
 
 public func getActiveDisplays() -> [DisplayInfo] {
+    getActiveDisplayIDs().map { id in
+        DisplayInfo(id: id, name: displayName(for: id))
+    }
+}
+
+/// Return active display IDs without resolving display names or modes.
+///
+/// The daemon uses this on its reapply timer, where fetching display metadata
+/// every 500 ms is unnecessary work.
+public func getActiveDisplayIDs() -> [CGDirectDisplayID] {
     var displayCount: UInt32 = 0
     let maxDisplays: UInt32 = 32
     var displays = [CGDirectDisplayID](repeating: 0, count: Int(maxDisplays))
@@ -21,10 +31,7 @@ public func getActiveDisplays() -> [DisplayInfo] {
         return []
     }
 
-    return (0..<Int(displayCount)).map { i in
-        let id = displays[i]
-        return DisplayInfo(id: id, name: displayName(for: id))
-    }
+    return Array(displays.prefix(Int(displayCount)))
 }
 
 public func gammaTableCapacity(for display: CGDirectDisplayID) -> Int {

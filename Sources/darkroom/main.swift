@@ -31,11 +31,11 @@ func invokedExecutablePath() -> String? {
 }
 
 /// Start darkroomd in the background if it isn't already running.
-/// Returns true if the daemon is now running.
-func ensureDaemon() -> Bool {
+/// Returns nil on success or a user-facing error on failure.
+func ensureDaemon() -> String? {
     // Quick check: is the daemon already reachable?
-    if case .success = DaemonSocket.send(.status) {
-        return true
+    if case .success = DaemonSocket.send(.status, timeout: 0.25) {
+        return nil
     }
 
     // Find darkroomd binary next to this process.
@@ -54,34 +54,42 @@ func ensureDaemon() -> Bool {
             ".build/release/darkroomd",
         ]
         daemonPath = candidates.first {
-            FileManager.default.fileExists(atPath: $0)
+            FileManager.default.isExecutableFile(atPath: $0)
         } ?? candidates[0]
+    }
+
+    guard FileManager.default.isExecutableFile(atPath: daemonPath) else {
+        return "darkroomd is missing or not executable at \(daemonPath)"
     }
 
     let task = Process()
     task.executableURL = URL(fileURLWithPath: daemonPath)
     task.standardOutput = FileHandle.nullDevice
     task.standardError = FileHandle.nullDevice
-    try? task.run()
+    do {
+        try task.run()
+    } catch {
+        return "could not launch darkroomd: \(error.localizedDescription)"
+    }
 
     // Wait for the daemon to become ready (poll the socket).
     for _ in 0..<30 {
         usleep(100_000)  // 100 ms
-        if case .success = DaemonSocket.send(.status) {
-            return true
+        if case .success = DaemonSocket.send(.status, timeout: 0.25) {
+            return nil
         }
     }
-    return false
+    return "darkroomd did not become ready"
 }
 
-func sendOrStart(_ command: DarkroomCommand, expectResponse: String) -> String {
+func sendOrStart(_ command: DarkroomCommand) -> String {
     switch DaemonSocket.send(command) {
     case .success(let response):
         return response
     case .failure:
         // Daemon not running — try to start it and retry.
-        guard ensureDaemon() else {
-            return "error: could not start darkroomd"
+        if let error = ensureDaemon() {
+            return "error: \(error)"
         }
         switch DaemonSocket.send(command, timeout: 10) {
         case .success(let response):
@@ -90,6 +98,13 @@ func sendOrStart(_ command: DarkroomCommand, expectResponse: String) -> String {
             return "error: \(err.description)"
         }
     }
+}
+
+func commandError(_ response: String) -> String {
+    if response.hasPrefix("error: ") {
+        return String(response.dropFirst("error: ".count))
+    }
+    return response
 }
 
 // MARK: - CLI
@@ -113,11 +128,11 @@ struct On: ParsableCommand {
     )
 
     func run() throws {
-        let result = sendOrStart(.on, expectResponse: "on ok")
+        let result = sendOrStart(.on)
         if result == "on ok" {
             print("Darkroom mode ON")
         } else {
-            print("Error: \(result)")
+            print("Error: \(commandError(result))")
             throw ExitCode.failure
         }
     }
@@ -130,11 +145,11 @@ struct Off: ParsableCommand {
     )
 
     func run() throws {
-        let result = sendOrStart(.off, expectResponse: "off ok")
+        let result = sendOrStart(.off)
         if result == "off ok" {
             print("Darkroom mode OFF")
         } else {
-            print("Error: \(result)")
+            print("Error: \(commandError(result))")
             throw ExitCode.failure
         }
     }
@@ -156,15 +171,17 @@ struct Status: ParsableCommand {
             return
         }
 
-        let anyActive = displays.contains { readDarkroomActive(for: $0.id) }
+        let displayStates = displays.map { display in
+            (display: display, active: readDarkroomActive(for: display.id))
+        }
+        let anyActive = displayStates.contains { $0.active }
         print("Darkroom mode: \(anyActive ? "ON" : "OFF")")
         if !daemonRunning {
             print("(daemon not running)")
         }
         print("\(displays.count) active display\(displays.count == 1 ? "" : "s"):")
-        for d in displays {
-            let active = readDarkroomActive(for: d.id)
-            print("  \(active ? "●" : "○") \(d.name) — \(active ? "darkroom" : "normal")")
+        for state in displayStates {
+            print("  \(state.active ? "●" : "○") \(state.display.name) — \(state.active ? "darkroom" : "normal")")
         }
     }
 }
@@ -187,19 +204,19 @@ struct Toggle: ParsableCommand {
         }
 
         if isCurrentlyOn {
-            let result = sendOrStart(.off, expectResponse: "off ok")
+            let result = sendOrStart(.off)
             if result == "off ok" {
                 print("Darkroom mode OFF")
             } else {
-                print("Error: \(result)")
+                print("Error: \(commandError(result))")
                 throw ExitCode.failure
             }
         } else {
-            let result = sendOrStart(.on, expectResponse: "on ok")
+            let result = sendOrStart(.on)
             if result == "on ok" {
                 print("Darkroom mode ON")
             } else {
-                print("Error: \(result)")
+                print("Error: \(commandError(result))")
                 throw ExitCode.failure
             }
         }

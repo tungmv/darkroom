@@ -28,13 +28,31 @@ public enum DaemonSocket {
         }
         defer { close(fd) }
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        let pathCap = MemoryLayout.size(ofValue: addr.sun_path)
-        withUnsafeMutablePointer(to: &addr.sun_path) { sunPathPtr in
-            sunPathPtr.withMemoryRebound(to: Int8.self, capacity: pathCap) { bufPtr in
-                _ = path.withCString { strcpy(bufPtr, $0) }
+        guard timeout > 0 else {
+            return .failure(.socketError("timeout must be greater than zero"))
+        }
+
+        var socketTimeout = timeval(
+            tv_sec: Int(timeout),
+            tv_usec: Int32((timeout.truncatingRemainder(dividingBy: 1)) * 1_000_000)
+        )
+        guard setsockopt(
+            fd, SOL_SOCKET, SO_SNDTIMEO, &socketTimeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        ) == 0,
+        setsockopt(
+            fd, SOL_SOCKET, SO_RCVTIMEO, &socketTimeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        ) == 0 else {
+            return .failure(.socketError("setsockopt() failed: \(lastError)"))
+        }
+
+        let addressResult = makeAddress()
+        guard case .success(var addr) = addressResult else {
+            if case .failure(let error) = addressResult {
+                return .failure(error)
             }
+            preconditionFailure("unreachable result state")
         }
 
         guard connect(fd, sockaddrCast(&addr), socklen_t(MemoryLayout<sockaddr_un>.size)) == 0
@@ -43,31 +61,91 @@ public enum DaemonSocket {
         }
 
         // Send command + newline.
-        let payload = command.rawValue + "\n"
-        guard payload.withCString({
-            write(fd, $0, payload.utf8.count)
-        }) > 0 else {
-            return .failure(.socketError("write failed: \(lastError)"))
+        let payload = Array((command.rawValue + "\n").utf8)
+        if let error = writeAll(fd: fd, bytes: payload) {
+            return .failure(error)
         }
 
         // Shutdown write side so the server knows we're done.
         shutdown(fd, SHUT_WR)
 
         // Read response.
-        var buf = [UInt8](repeating: 0, count: 1024)
-        let n = read(fd, &buf, buf.count)
-        guard n > 0 else {
-            if n == 0 {
-                return .failure(.socketError("daemon closed connection"))
+        var responseBytes: [UInt8] = []
+        responseBytes.reserveCapacity(128)
+        var buffer = [UInt8](repeating: 0, count: 512)
+
+        while responseBytes.count < 4096 {
+            let count = read(fd, &buffer, buffer.count)
+            if count > 0 {
+                responseBytes.append(contentsOf: buffer.prefix(count))
+                if responseBytes.contains(0x0A) { break }
+                continue
+            }
+            if count == 0 { break }
+            if errno == EINTR { continue }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                return .failure(.socketError("daemon response timed out"))
             }
             return .failure(.socketError("read failed: \(lastError)"))
         }
 
-        let response = String(decoding: buf[0..<n], as: UTF8.self).trimmingCharacters(in: .newlines)
+        guard !responseBytes.isEmpty else {
+            return .failure(.socketError("daemon closed connection"))
+        }
+
+        let line = responseBytes.prefix { $0 != 0x0A }
+        let response = String(decoding: line, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         return .success(response)
     }
 
     // MARK: - Helpers
+
+    /// Build a bounded Unix-domain socket address for both client and server.
+    public static func makeAddress() -> Result<sockaddr_un, DarkroomError> {
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+
+        let pathBytes = Array(path.utf8CString)
+        let capacity = MemoryLayout.size(ofValue: address.sun_path)
+        guard pathBytes.count <= capacity else {
+            return .failure(.socketError(
+                "socket path is too long (maximum \(capacity - 1) UTF-8 bytes): \(path)"
+            ))
+        }
+
+        withUnsafeMutableBytes(of: &address.sun_path) { destination in
+            pathBytes.withUnsafeBytes { source in
+                destination.copyBytes(from: source)
+            }
+        }
+        return .success(address)
+    }
+
+    private static func writeAll(fd: Int32, bytes: [UInt8]) -> DarkroomError? {
+        bytes.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return nil }
+
+            var offset = 0
+            while offset < rawBuffer.count {
+                let count = write(
+                    fd,
+                    baseAddress.advanced(by: offset),
+                    rawBuffer.count - offset
+                )
+                if count > 0 {
+                    offset += count
+                } else if count < 0 && errno == EINTR {
+                    continue
+                } else if count < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return .socketError("daemon request timed out")
+                } else {
+                    return .socketError("write failed: \(lastError)")
+                }
+            }
+            return nil
+        }
+    }
 
     private static func sockaddrCast(_ ptr: UnsafeMutablePointer<sockaddr_un>)
         -> UnsafeMutablePointer<sockaddr>

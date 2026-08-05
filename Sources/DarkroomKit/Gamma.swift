@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 
 public struct GammaTable: Sendable {
     public let capacity: Int
@@ -14,6 +15,7 @@ public struct GammaTable: Sendable {
     }
 
     public mutating func setDarkroom() {
+        guard capacity > 1 else { return }
         let maxIndex = capacity - 1
         for i in 0..<capacity {
             let input = CGGammaValue(i) / CGGammaValue(maxIndex)
@@ -24,6 +26,7 @@ public struct GammaTable: Sendable {
     }
 
     public mutating func setIdentity() {
+        guard capacity > 1 else { return }
         let maxIndex = capacity - 1
         for i in 0..<capacity {
             let input = CGGammaValue(i) / CGGammaValue(maxIndex)
@@ -34,34 +37,86 @@ public struct GammaTable: Sendable {
     }
 }
 
-@discardableResult
-public func applyGamma(enabled: Bool, to displayIDs: [CGDirectDisplayID]) -> Bool {
-    var allOK = true
+private struct GammaTableKey: Hashable {
+    let capacity: Int
+    let enabled: Bool
+}
 
-    for id in displayIDs {
-        let capacity = gammaTableCapacity(for: id)
-        guard capacity > 0 else {
-            allOK = false
-            continue
-        }
+private final class GammaTableBuffers {
+    var table: GammaTable
 
+    init(capacity: Int, enabled: Bool) {
         var table = GammaTable(capacity: capacity)
         if enabled {
             table.setDarkroom()
         } else {
             table.setIdentity()
         }
-
-        let result = CGSetDisplayTransferByTable(
-            id, UInt32(capacity),
-            &table.red, &table.green, &table.blue
-        )
-        if result != .success {
-            allOK = false
-        }
+        self.table = table
     }
+}
 
-    return allOK
+/// Applies gamma tables while reusing the immutable buffers for each table
+/// capacity. Calls are serialized because CoreGraphics and the cached buffers
+/// may be reached by both daemon commands and the reapply timer.
+public final class GammaApplier: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cache: [GammaTableKey: GammaTableBuffers] = [:]
+
+    public init() {}
+
+    @discardableResult
+    public func apply(enabled: Bool, to displayIDs: [CGDirectDisplayID]) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !displayIDs.isEmpty else { return false }
+
+        var allOK = true
+        for id in displayIDs {
+            let capacity = gammaTableCapacity(for: id)
+            guard capacity > 1 else {
+                allOK = false
+                continue
+            }
+
+            let key = GammaTableKey(capacity: capacity, enabled: enabled)
+            let buffers: GammaTableBuffers
+            if let cached = cache[key] {
+                buffers = cached
+            } else {
+                let newBuffers = GammaTableBuffers(capacity: capacity, enabled: enabled)
+                cache[key] = newBuffers
+                buffers = newBuffers
+            }
+
+            let result = buffers.table.red.withUnsafeBufferPointer { red in
+                buffers.table.green.withUnsafeBufferPointer { green in
+                    buffers.table.blue.withUnsafeBufferPointer { blue in
+                        CGSetDisplayTransferByTable(
+                            id,
+                            UInt32(capacity),
+                            red.baseAddress,
+                            green.baseAddress,
+                            blue.baseAddress
+                        )
+                    }
+                }
+            }
+            if result != .success {
+                allOK = false
+            }
+        }
+
+        return allOK
+    }
+}
+
+private let sharedGammaApplier = GammaApplier()
+
+@discardableResult
+public func applyGamma(enabled: Bool, to displayIDs: [CGDirectDisplayID]) -> Bool {
+    sharedGammaApplier.apply(enabled: enabled, to: displayIDs)
 }
 
 public func readDarkroomActive(for displayID: CGDirectDisplayID) -> Bool {

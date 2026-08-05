@@ -6,7 +6,7 @@ BINDIR ?= $(DESTDIR)$(PREFIX)/bin
 # If you do `sudo make install`, the build still runs as root again; avoid that.
 SUDO ?= sudo
 
-BUILD_DIR = .build/arm64-apple-macosx
+BUILD_DIR ?= .build/$(shell uname -m)-apple-macosx
 
 build:
 	swift build -c release
