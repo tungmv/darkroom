@@ -65,6 +65,12 @@ public final class GammaApplier: @unchecked Sendable {
 
     public init() {}
 
+    /// Returns true when at least one display accepted the gamma table.
+    ///
+    /// CoreGraphics can include mirrored, virtual, and system-managed displays
+    /// in the active display list even though they do not expose a writable
+    /// gamma table. Those displays must not prevent capable displays from
+    /// being updated.
     @discardableResult
     public func apply(enabled: Bool, to displayIDs: [CGDirectDisplayID]) -> Bool {
         lock.lock()
@@ -72,11 +78,10 @@ public final class GammaApplier: @unchecked Sendable {
 
         guard !displayIDs.isEmpty else { return false }
 
-        var allOK = true
+        var appliedToAnyDisplay = false
         for id in displayIDs {
             let capacity = gammaTableCapacity(for: id)
             guard capacity > 1 else {
-                allOK = false
                 continue
             }
 
@@ -103,12 +108,12 @@ public final class GammaApplier: @unchecked Sendable {
                     }
                 }
             }
-            if result != .success {
-                allOK = false
+            if result == .success {
+                appliedToAnyDisplay = true
             }
         }
 
-        return allOK
+        return appliedToAnyDisplay
     }
 }
 

@@ -165,7 +165,7 @@ final class DarkroomDaemon: @unchecked Sendable {
                 _ = gammaApplier.apply(enabled: false, to: ids)
                 darkroomEnabled = false
                 stopGammaTimer()
-                _ = respond(fd, "error: failed to apply gamma to all active displays")
+                _ = respond(fd, "error: no active display accepted the gamma table")
                 return
             }
 
@@ -177,7 +177,7 @@ final class DarkroomDaemon: @unchecked Sendable {
             stopGammaTimer()
             darkroomEnabled = false
             guard gammaApplier.apply(enabled: false, to: getActiveDisplayIDs()) else {
-                _ = respond(fd, "error: failed to restore gamma on all active displays")
+                _ = respond(fd, "error: no active display accepted the normal gamma table")
                 return
             }
             _ = respond(fd, "off ok")
