@@ -13,12 +13,18 @@ build:
 
 # Build as the invoking user, then copy into $(BINDIR) with sudo.
 install: build
+	@if [ -x "$(BINDIR)/darkroom" ]; then \
+		"$(BINDIR)/darkroom" stop >/dev/null 2>&1 || true; \
+	fi
 	$(SUDO) install -d "$(BINDIR)"
 	$(SUDO) install "$(BUILD_DIR)/release/darkroom" "$(BINDIR)/darkroom"
 	$(SUDO) install "$(BUILD_DIR)/release/darkroomd" "$(BINDIR)/darkroomd"
 
 # Install only (assumes you already built): `make build && sudo make install-only`
 install-only:
+	@if [ -x "$(BINDIR)/darkroom" ]; then \
+		"$(BINDIR)/darkroom" stop >/dev/null 2>&1 || true; \
+	fi
 	install -d "$(BINDIR)"
 	install "$(BUILD_DIR)/release/darkroom" "$(BINDIR)/darkroom"
 	install "$(BUILD_DIR)/release/darkroomd" "$(BINDIR)/darkroomd"

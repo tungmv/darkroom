@@ -114,7 +114,7 @@ struct Darkroom: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "darkroom",
         abstract: "Toggle darkroom mode from the terminal (red-only, low-light friendly).",
-        subcommands: [On.self, Off.self, Status.self, Toggle.self],
+        subcommands: [On.self, Off.self, Status.self, Toggle.self, Stop.self],
         defaultSubcommand: Toggle.self
     )
 }
@@ -182,6 +182,38 @@ struct Status: ParsableCommand {
         print("\(displays.count) active display\(displays.count == 1 ? "" : "s"):")
         for state in displayStates {
             print("  \(state.active ? "●" : "○") \(state.display.name) — \(state.active ? "darkroom" : "normal")")
+        }
+    }
+}
+
+struct Stop: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "stop",
+        abstract: "Stop the background daemon and restore normal gamma."
+    )
+
+    func run() throws {
+        switch DaemonSocket.send(.stop) {
+        case .success("stopping"):
+            // The daemon writes its response before completing cleanup. Wait
+            // until it has removed the socket so an install/restart cannot
+            // accidentally keep talking to the old executable.
+            for _ in 0..<50 {
+                if case .failure = DaemonSocket.send(.status, timeout: 0.1) {
+                    print("Darkroom daemon stopped")
+                    return
+                }
+                usleep(20_000)
+            }
+            print("Error: darkroomd did not stop")
+            throw ExitCode.failure
+
+        case .success(let response):
+            print("Error: \(commandError(response))")
+            throw ExitCode.failure
+
+        case .failure:
+            print("Darkroom daemon is not running")
         }
     }
 }

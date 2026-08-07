@@ -13,9 +13,12 @@ darkroom on       # Enable darkroom mode
 darkroom off      # Restore normal gamma
 darkroom status   # Check current state
 darkroom toggle   # Toggle on/off
+darkroom stop     # Restore normal gamma and stop the background daemon
 ```
 
-The daemon starts automatically on first use and stops via `SIGINT`/`SIGTERM`.
+The daemon starts automatically on first use. `make install` stops an existing
+installed daemon before replacing its executable, so the next command always
+runs the newly installed version.
 
 ## Build
 
