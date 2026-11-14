@@ -2,109 +2,19 @@ import ArgumentParser
 import DarkroomKit
 import Foundation
 
-// MARK: - Daemon helpers
-
-/// Resolve the executable path used to invoke this process.
-///
-/// Shells commonly preserve `argv[0]` as just `darkroom`, even when they found
-/// it through `PATH`, so it cannot be assumed to be an absolute path.
-func invokedExecutablePath() -> String? {
-    let invocation = CommandLine.arguments[0]
-    let fileManager = FileManager.default
-
-    if invocation.contains("/") {
-        return fileManager.fileExists(atPath: invocation) ? invocation : nil
-    }
-
-    let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
-    for directory in path.split(separator: ":", omittingEmptySubsequences: false) {
-        let base = directory.isEmpty ? "." : String(directory)
-        let candidate = URL(fileURLWithPath: base)
-            .appendingPathComponent(invocation)
-            .path
-        if fileManager.isExecutableFile(atPath: candidate) {
-            return candidate
-        }
-    }
-
-    return nil
-}
-
-/// Start darkroomd in the background if it isn't already running.
-/// Returns nil on success or a user-facing error on failure.
-func ensureDaemon() -> String? {
-    // Quick check: is the daemon already reachable?
-    if case .success = DaemonSocket.send(.status, timeout: 0.25) {
-        return nil
-    }
-
-    // Find darkroomd binary next to this process.
-    let daemonPath: String
-    if let ourPath = invokedExecutablePath(),
-       URL(fileURLWithPath: ourPath).lastPathComponent == "darkroom" {
-        // Installed side-by-side.
-        daemonPath = URL(fileURLWithPath: ourPath)
-            .deletingLastPathComponent()
-            .appendingPathComponent("darkroomd")
-            .path
-    } else {
-        // Running via swift run — try common locations.
-        let candidates = [
-            ".build/debug/darkroomd",
-            ".build/release/darkroomd",
-        ]
-        daemonPath = candidates.first {
-            FileManager.default.isExecutableFile(atPath: $0)
-        } ?? candidates[0]
-    }
-
-    guard FileManager.default.isExecutableFile(atPath: daemonPath) else {
-        return "darkroomd is missing or not executable at \(daemonPath)"
-    }
-
-    let task = Process()
-    task.executableURL = URL(fileURLWithPath: daemonPath)
-    task.standardOutput = FileHandle.nullDevice
-    task.standardError = FileHandle.nullDevice
-    do {
-        try task.run()
-    } catch {
-        return "could not launch darkroomd: \(error.localizedDescription)"
-    }
-
-    // Wait for the daemon to become ready (poll the socket).
-    for _ in 0..<30 {
-        usleep(100_000)  // 100 ms
-        if case .success = DaemonSocket.send(.status, timeout: 0.25) {
-            return nil
-        }
-    }
-    return "darkroomd did not become ready"
-}
+// MARK: - Shared helpers
 
 func sendOrStart(_ command: DarkroomCommand) -> String {
-    switch DaemonSocket.send(command) {
+    switch DarkroomClient.send(command) {
     case .success(let response):
         return response
-    case .failure:
-        // Daemon not running — try to start it and retry.
-        if let error = ensureDaemon() {
-            return "error: \(error)"
-        }
-        switch DaemonSocket.send(command, timeout: 10) {
-        case .success(let response):
-            return response
-        case .failure(let err):
-            return "error: \(err.description)"
-        }
+    case .failure(let error):
+        return "error: \(error.description)"
     }
 }
 
 func commandError(_ response: String) -> String {
-    if response.hasPrefix("error: ") {
-        return String(response.dropFirst("error: ".count))
-    }
-    return response
+    DarkroomClient.commandError(response)
 }
 
 // MARK: - CLI
@@ -114,7 +24,10 @@ struct Darkroom: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "darkroom",
         abstract: "Toggle darkroom mode from the terminal (red-only, low-light friendly).",
-        subcommands: [On.self, Off.self, Status.self, Toggle.self, Stop.self],
+        subcommands: [
+            On.self, Off.self, Status.self, Toggle.self, Stop.self,
+            Intensity.self, Get.self, Gui.self,
+        ],
         defaultSubcommand: Toggle.self
     )
 }
@@ -127,10 +40,29 @@ struct On: ParsableCommand {
         abstract: "Enable darkroom mode on all active displays."
     )
 
+    @Option(name: .customLong("intensity"), help: "Strength: 0-100 or 0.0-1.0.")
+    var intensity: String?
+
     func run() throws {
+        if let intensity {
+            guard let value = DarkroomIntensity.parse(intensity) else {
+                print("Error: intensity must be between 0 and 100 (or 0.0-1.0)")
+                throw ExitCode.failure
+            }
+            let result = sendOrStart(.intensity(value))
+            if result.hasPrefix("intensity ok") {
+                print("Darkroom mode ON (\(Intensity.describe(result)))")
+            } else {
+                print("Error: \(commandError(result))")
+                throw ExitCode.failure
+            }
+            return
+        }
+
         let result = sendOrStart(.on)
         if result == "on ok" {
-            print("Darkroom mode ON")
+            let percent = DarkroomIntensity.percent(from: DarkroomClient.currentIntensity())
+            print("Darkroom mode ON (\(percent)%)")
         } else {
             print("Error: \(commandError(result))")
             throw ExitCode.failure
@@ -164,24 +96,166 @@ struct Status: ParsableCommand {
     func run() throws {
         // Read status directly from gamma tables (works even if daemon is offline).
         let displays = getActiveDisplays()
-        let daemonRunning = (try? DaemonSocket.send(.status).get()) != nil
+        let daemonRunning = DarkroomClient.isDaemonRunning()
 
         guard !displays.isEmpty else {
-            print("No active displays found.")
+            // Screens asleep / session locked: still report the daemon's intent
+            // so `status` is useful in scripts.
+            let intent = DarkroomClient.currentIntensity()
+            print("Darkroom mode: \(intent > 0 ? "ON" : "OFF")")
+            if intent > 0 {
+                print("Intensity: \(DarkroomIntensity.percent(from: intent))%")
+            }
+            print("No active displays (screen asleep or session locked).")
             return
         }
 
         let displayStates = displays.map { display in
-            (display: display, active: readDarkroomActive(for: display.id))
+            (
+                display: display,
+                intensity: readDarkroomIntensity(for: display.id)
+            )
         }
-        let anyActive = displayStates.contains { $0.active }
-        print("Darkroom mode: \(anyActive ? "ON" : "OFF")")
+        let active = displayStates.filter { $0.intensity > 0 }
+        let strongest = active.map(\.intensity).max() ?? 0
+
+        print("Darkroom mode: \(active.isEmpty ? "OFF" : "ON")")
+        if !active.isEmpty {
+            print("Intensity: \(DarkroomIntensity.percent(from: strongest))%")
+        }
         if !daemonRunning {
             print("(daemon not running)")
         }
         print("\(displays.count) active display\(displays.count == 1 ? "" : "s"):")
         for state in displayStates {
-            print("  \(state.active ? "●" : "○") \(state.display.name) — \(state.active ? "darkroom" : "normal")")
+            let label = state.intensity > 0
+                ? "darkroom \(DarkroomIntensity.percent(from: state.intensity))%"
+                : "normal"
+            print("  \(state.intensity > 0 ? "●" : "○") \(state.display.name) — \(label)")
+        }
+    }
+}
+
+struct Intensity: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "intensity",
+        abstract: "Set the darkroom strength (0 = normal, 100 = red-only)."
+    )
+
+    @Argument(help: "Strength as a percentage (0-100) or a fraction (0.0-1.0).")
+    var value: String
+
+    func run() throws {
+        guard let normalized = DarkroomIntensity.parse(value) else {
+            print("Error: intensity must be between 0 and 100 (or 0.0-1.0)")
+            throw ExitCode.failure
+        }
+
+        let result = sendOrStart(.intensity(normalized))
+        if result.hasPrefix("intensity ok") {
+            print("Darkroom intensity \(Self.describe(result))")
+        } else {
+            print("Error: \(commandError(result))")
+            throw ExitCode.failure
+        }
+    }
+
+    static func describe(_ response: String) -> String {
+        guard let intensity = DarkroomClient.parseIntensityResponse(response) else {
+            return ""
+        }
+        return "\(DarkroomIntensity.percent(from: intensity))%"
+    }
+}
+
+struct Get: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "get",
+        abstract: "Print the current darkroom intensity as a percentage."
+    )
+
+    func run() throws {
+        let intensity = DarkroomClient.currentIntensity()
+        print(DarkroomIntensity.percent(from: intensity))
+    }
+}
+
+struct Gui: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "gui",
+        abstract: "Launch the menu bar app with the intensity slider."
+    )
+
+    func run() throws {
+        var candidates = [
+            FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Applications/Darkroom.app").path,
+            "/Applications/Darkroom.app",
+        ]
+
+        // Alongside the executable (installed bundle) and, for development,
+        // next to the package root that holds .build/Darkroom.app.
+        if let executable = invokedExecutablePath() {
+            let directory = URL(fileURLWithPath: executable).deletingLastPathComponent()
+            candidates.append(directory.appendingPathComponent("Darkroom.app").path)
+            candidates.append(
+                directory.deletingLastPathComponent()
+                    .appendingPathComponent("Darkroom.app").path)
+            candidates.append(
+                directory.appendingPathComponent(".build/Darkroom.app").path)
+        }
+        candidates.append(".build/Darkroom.app")
+
+        guard let app = candidates.first(where: {
+            FileManager.default.fileExists(atPath: $0)
+        }) else {
+            print("""
+            Error: Darkroom.app was not found. Build it with:
+              make app
+            """)
+            throw ExitCode.failure
+        }
+
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        task.arguments = [app]
+        do {
+            try task.run()
+            task.waitUntilExit()
+            print("Launched \(app)")
+        } catch {
+            print("Error: could not launch \(app): \(error.localizedDescription)")
+            throw ExitCode.failure
+        }
+    }
+}
+
+struct Toggle: ParsableCommand {
+    static let configuration = CommandConfiguration(
+        commandName: "toggle",
+        abstract: "Toggle darkroom mode on/off."
+    )
+
+    func run() throws {
+        // Check current state via the daemon (if running) or gamma tables.
+        let isCurrentlyOn = DarkroomClient.currentIntensity() > 0
+
+        if isCurrentlyOn {
+            let result = sendOrStart(.off)
+            if result == "off ok" {
+                print("Darkroom mode OFF")
+            } else {
+                print("Error: \(commandError(result))")
+                throw ExitCode.failure
+            }
+        } else {
+            let result = sendOrStart(.on)
+            if result == "on ok" {
+                print("Darkroom mode ON")
+            } else {
+                print("Error: \(commandError(result))")
+                throw ExitCode.failure
+            }
         }
     }
 }
@@ -214,43 +288,6 @@ struct Stop: ParsableCommand {
 
         case .failure:
             print("Darkroom daemon is not running")
-        }
-    }
-}
-
-struct Toggle: ParsableCommand {
-    static let configuration = CommandConfiguration(
-        commandName: "toggle",
-        abstract: "Toggle darkroom mode on/off."
-    )
-
-    func run() throws {
-        // Check current state via the daemon (if running) or gamma tables.
-        let isCurrentlyOn: Bool
-        if case .success(let resp) = DaemonSocket.send(.status), resp == "on" {
-            isCurrentlyOn = true
-        } else {
-            // Daemon not running — fall back to reading gamma tables directly.
-            let displays = getActiveDisplays()
-            isCurrentlyOn = displays.contains { readDarkroomActive(for: $0.id) }
-        }
-
-        if isCurrentlyOn {
-            let result = sendOrStart(.off)
-            if result == "off ok" {
-                print("Darkroom mode OFF")
-            } else {
-                print("Error: \(commandError(result))")
-                throw ExitCode.failure
-            }
-        } else {
-            let result = sendOrStart(.on)
-            if result == "on ok" {
-                print("Darkroom mode ON")
-            } else {
-                print("Error: \(commandError(result))")
-                throw ExitCode.failure
-            }
         }
     }
 }

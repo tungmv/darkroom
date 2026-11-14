@@ -3,7 +3,9 @@ import PackageDescription
 
 let package = Package(
     name: "darkroom",
-    platforms: [.macOS(.v10_13)],
+    // The menu bar app uses SwiftUI-era AppKit APIs (NSSwitch, MainActor
+    // tasks), so the whole package targets macOS 13.
+    platforms: [.macOS(.v13)],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
     ],
@@ -20,6 +22,12 @@ let package = Package(
         ),
         .executableTarget(
             name: "darkroomd",
+            dependencies: ["DarkroomKit"]
+        ),
+        // Menu bar app with the intensity slider. Built as a plain executable
+        // and wrapped into Darkroom.app by `make app`.
+        .executableTarget(
+            name: "darkroom-gui",
             dependencies: ["DarkroomKit"]
         ),
         .testTarget(

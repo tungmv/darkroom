@@ -6,7 +6,8 @@ import Foundation
 final class DarkroomDaemon: @unchecked Sendable {
     private let queue = DispatchQueue(label: "sh.darkroom.darkroomd.state")
     private let gammaApplier = GammaApplier()
-    private var darkroomEnabled = false
+    /// Strength currently applied, 0...1. `0` means normal gamma.
+    private var intensity: Double = 0
     private var gammaTimer: DispatchSourceTimer?
     private var signalSources: [DispatchSourceSignal] = []
     private var lockFD: Int32 = -1
@@ -17,9 +18,12 @@ final class DarkroomDaemon: @unchecked Sendable {
 
         queue.sync {
             let ids = getActiveDisplayIDs()
-            darkroomEnabled = ids.contains { readDarkroomActive(for: $0) }
-            if darkroomEnabled {
+            let measured = currentDarkroomIntensity(for: ids)
+            if measured > 0 {
+                intensity = measured
                 startGammaTimer()
+            } else {
+                intensity = 0
             }
         }
 
@@ -66,8 +70,8 @@ final class DarkroomDaemon: @unchecked Sendable {
     private func restoreAndExit() -> Never {
         fputs("darkroomd: restoring gamma and exiting\n", stderr)
         stopGammaTimer()
-        _ = gammaApplier.apply(enabled: false, to: getActiveDisplayIDs())
-        darkroomEnabled = false
+        _ = gammaApplier.apply(intensity: 0, to: getActiveDisplayIDs())
+        intensity = 0
         unlink(DaemonSocket.path)
         if lockFD >= 0 {
             close(lockFD)
@@ -87,9 +91,9 @@ final class DarkroomDaemon: @unchecked Sendable {
             leeway: .milliseconds(50)
         )
         timer.setEventHandler { [weak self] in
-            guard let self, self.darkroomEnabled else { return }
+            guard let self, self.intensity > 0 else { return }
             _ = self.gammaApplier.apply(
-                enabled: true,
+                intensity: self.intensity,
                 to: getActiveDisplayIDs()
             )
         }
@@ -152,7 +156,7 @@ final class DarkroomDaemon: @unchecked Sendable {
 
     private func handleClient(_ fd: Int32) {
         guard let rawCommand = readCommand(from: fd),
-              let command = DarkroomCommand(rawValue: rawCommand)
+              let command = DarkroomCommand(wireValue: rawCommand)
         else {
             _ = respond(fd, "error: invalid command")
             return
@@ -160,35 +164,76 @@ final class DarkroomDaemon: @unchecked Sendable {
 
         switch command {
         case .on:
-            let ids = getActiveDisplayIDs()
-            guard gammaApplier.apply(enabled: true, to: ids) else {
-                _ = gammaApplier.apply(enabled: false, to: ids)
-                darkroomEnabled = false
-                stopGammaTimer()
+            let target = DarkroomSettings.loadIntensityOrDefault()
+            guard setIntensity(target) else {
                 _ = respond(fd, "error: no active display accepted the gamma table")
                 return
             }
-
-            darkroomEnabled = true
-            startGammaTimer()
             _ = respond(fd, "on ok")
 
         case .off:
-            stopGammaTimer()
-            darkroomEnabled = false
-            guard gammaApplier.apply(enabled: false, to: getActiveDisplayIDs()) else {
+            guard setIntensity(0) else {
                 _ = respond(fd, "error: no active display accepted the normal gamma table")
                 return
             }
             _ = respond(fd, "off ok")
 
+        case .intensity(let value):
+            guard setIntensity(value) else {
+                _ = respond(fd, "error: no active display accepted the gamma table")
+                return
+            }
+            let percent = DarkroomIntensity.percent(from: intensity)
+            if percent > 0 {
+                DarkroomSettings.saveIntensity(intensity)
+            }
+            _ = respond(fd, "intensity ok \(percent)")
+
+        case .get:
+            _ = respond(fd, "intensity \(DarkroomIntensity.percent(from: intensity))")
+
         case .status:
-            _ = respond(fd, darkroomEnabled ? "on" : "off")
+            _ = respond(fd, intensity > 0 ? "on" : "off")
 
         case .stop:
             _ = respond(fd, "stopping")
             restoreAndExit()
         }
+    }
+
+    /// Apply `value` to every active display and update the timer state.
+    /// Returns false only when displays exist but none accepted the table.
+    private func setIntensity(_ value: Double) -> Bool {
+        let target = DarkroomIntensity.normalized(value)
+        let ids = getActiveDisplayIDs()
+
+        // No active displays means the screens are asleep or the session is
+        // locked, not that the request is invalid. Record the intent and let
+        // the reapply timer paint it once a display comes back.
+        if ids.isEmpty {
+            intensity = target
+            if target > 0 {
+                startGammaTimer()
+            } else {
+                stopGammaTimer()
+            }
+            return true
+        }
+
+        guard gammaApplier.apply(intensity: target, to: ids) else {
+            // Roll back so the state never claims an intensity that is not on
+            // screen.
+            _ = gammaApplier.apply(intensity: intensity, to: getActiveDisplayIDs())
+            return false
+        }
+
+        intensity = target
+        if target > 0 {
+            startGammaTimer()
+        } else {
+            stopGammaTimer()
+        }
+        return true
     }
 
     private func readCommand(from fd: Int32) -> String? {

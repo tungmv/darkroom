@@ -61,7 +61,7 @@ public enum DaemonSocket {
         }
 
         // Send command + newline.
-        let payload = Array((command.rawValue + "\n").utf8)
+        let payload = Array((command.wireValue + "\n").utf8)
         if let error = writeAll(fd: fd, bytes: payload) {
             return .failure(error)
         }
@@ -160,21 +160,79 @@ public enum DaemonSocket {
 
 // MARK: - Commands & Error
 
-public enum DarkroomCommand: String, CaseIterable {
-    case on      = "on"
-    case off     = "off"
-    case status  = "status"
-    case stop    = "stop"
+/// Wire protocol spoken over the Unix socket. One command per connection, one
+/// response line.
+///
+/// Wire forms:
+///
+///     on                 -> "on ok"
+///     off                -> "off ok"
+///     status             -> "on" | "off"
+///     stop               -> "stopping"
+///     intensity <0-100>  -> "intensity ok <0-100>"
+///     get                -> "intensity <0-100>"
+public enum DarkroomCommand: Sendable, Equatable {
+    case on
+    case off
+    case status
+    case stop
+    /// Set the darkroom strength. `0` restores normal gamma, `1` is red-only.
+    case intensity(Double)
+    /// Report the current darkroom strength.
+    case get
+
+    public var wireValue: String {
+        switch self {
+        case .on: return "on"
+        case .off: return "off"
+        case .status: return "status"
+        case .stop: return "stop"
+        case .intensity(let value):
+            return "intensity \(DarkroomIntensity.percent(from: value))"
+        case .get: return "get"
+        }
+    }
+
+    /// Parse a wire command coming from a client.
+    public init?(wireValue raw: String) {
+        let parts = raw.split(separator: " ", maxSplits: 1)
+        guard let verb = parts.first else { return nil }
+        let argument = parts.count > 1
+            ? parts[1].trimmingCharacters(in: .whitespaces)
+            : ""
+
+        switch verb {
+        case "on":
+            self = .on
+        case "off":
+            self = .off
+        case "status":
+            self = .status
+        case "stop":
+            self = .stop
+        case "get":
+            self = .get
+        case "intensity":
+            guard let value = DarkroomIntensity.parse(argument) else { return nil }
+            self = .intensity(value)
+        default:
+            return nil
+        }
+    }
 }
 
 public enum DarkroomError: Error, CustomStringConvertible {
     case notRunning(String)
     case socketError(String)
+    /// The daemon answered, but does not understand the requested command
+    /// (usually because an older `darkroomd` is still running).
+    case outOfDate(String)
 
     public var description: String {
         switch self {
         case .notRunning(let msg): return msg
         case .socketError(let msg): return msg
+        case .outOfDate(let msg): return msg
         }
     }
 }
